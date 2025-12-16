@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import altair as alt
 import numpy as np
@@ -185,6 +184,10 @@ def chart_probs(df_probs: pd.DataFrame, col: str, title: str) -> alt.Chart:
     )
 
 
+def _load_sample() -> pd.DataFrame:
+    return pd.read_csv("data_sample_playoffs.csv")
+
+
 def main() -> None:
     st.set_page_config(page_title="Super Bowl Winner Prediction Dashboard", layout="wide")
     st.title("Super Bowl Winner Prediction Dashboard")
@@ -198,6 +201,13 @@ def main() -> None:
         )
 
         auto_seed = st.checkbox("Auto-seed 1..7 by rating within each conference", value=True)
+        if source == "Manual entry":
+            cols = st.columns(2)
+            with cols[0]:
+                if st.button("Reset editor to sample"):
+                    st.session_state["manual_field_df"] = _load_sample()
+            with cols[1]:
+                st.caption("Edits re-run the simulation automatically.")
         st.divider()
 
         st.header("Model")
@@ -212,7 +222,7 @@ def main() -> None:
     params = ModelParams(k=float(k), home_field_elo=float(home_field_elo))
 
     if source == "Use sample playoff field":
-        raw = pd.read_csv("data_sample_playoffs.csv")
+        raw = _load_sample()
     elif source == "Upload CSV":
         up = st.file_uploader("Upload a CSV with columns: team, conference, seed, rating", type=["csv"])
         if up is None:
@@ -220,9 +230,20 @@ def main() -> None:
             return
         raw = pd.read_csv(up)
     else:
-        st.caption("Enter 14 playoff teams (7 AFC, 7 NFC). Ratings are on an Elo-like scale (1500 = average).")
-        starter = pd.read_csv("data_sample_playoffs.csv")
-        raw = st.data_editor(starter, num_rows="fixed", use_container_width=True)
+        st.caption(
+            "Update teams/seeds week-to-week here. Add/remove rows as needed, then ensure you end up with 7 AFC + 7 NFC teams. "
+            "Ratings are Elo-like (1500 ~ average)."
+        )
+        if "manual_field_df" not in st.session_state:
+            st.session_state["manual_field_df"] = _load_sample()
+        raw = st.data_editor(
+            st.session_state["manual_field_df"],
+            num_rows="dynamic",
+            use_container_width=True,
+            key="manual_field_editor",
+        )
+        # Persist edits across reruns within the session.
+        st.session_state["manual_field_df"] = pd.DataFrame(raw)
 
     try:
         df = normalize_input_df(pd.DataFrame(raw))
@@ -231,13 +252,21 @@ def main() -> None:
         validate_playoff_field(df)
     except Exception as e:
         st.error(str(e))
-        st.stop()
+        return
 
     left, right = st.columns([1.05, 0.95], gap="large")
 
     with left:
         st.subheader("Playoff field")
         st.dataframe(df.sort_values(["conference", "seed"]), use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "Download this field as CSV",
+            data=df[REQUIRED_COLS].to_csv(index=False).encode("utf-8"),
+            file_name="playoff_field.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
         st.subheader("Matchup win probability")
         teams = df["team"].tolist()
