@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import altair as alt
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 
@@ -188,6 +189,101 @@ def _load_sample() -> pd.DataFrame:
     return pd.read_csv("data_sample_playoffs.csv")
 
 
+def _default_rating_from_seed(seed: int) -> float:
+    # Simple starter rating curve; user can edit ratings later.
+    return 1560.0 + (8 - int(seed)) * 20.0
+
+
+def _team_name_from_obj(obj: Any) -> Optional[str]:
+    if isinstance(obj, str):
+        s = obj.strip()
+        return s or None
+    if not isinstance(obj, dict):
+        return None
+
+    for k in ["displayName", "fullName", "name", "teamName", "team_name", "clubName", "club_name"]:
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # Some payloads use nested structures like {"team": {"displayName": ...}}
+    for k in ["team", "club", "franchise"]:
+        v = obj.get(k)
+        name = _team_name_from_obj(v)
+        if name:
+            return name
+    return None
+
+
+def _extract_seed_map(payload: Any) -> Dict[int, str]:
+    """
+    Heuristic extraction of seed -> team name from NFL playoff-picture payloads.
+    Keeps the *first* team encountered for each seed 1..7.
+    """
+    found: Dict[int, str] = {}
+
+    def walk(x: Any) -> None:
+        if len(found) == 7:
+            return
+        if isinstance(x, dict):
+            seed_val: Optional[int] = None
+            for sk in ["seed", "seedNumber", "seed_num", "seedRank", "seed_rank"]:
+                v = x.get(sk)
+                if isinstance(v, (int, float)) and int(v) == v:
+                    iv = int(v)
+                    if 1 <= iv <= 7:
+                        seed_val = iv
+                        break
+
+            if seed_val is not None and seed_val not in found:
+                # Try to find a name in this object or common nested keys.
+                name = None
+                for nk in ["team", "club", "franchise", "teamData", "teamInfo", "teamDetails"]:
+                    if nk in x:
+                        name = _team_name_from_obj(x.get(nk))
+                        if name:
+                            break
+                if not name:
+                    name = _team_name_from_obj(x)
+                if name:
+                    found[seed_val] = name
+
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(payload)
+    return found
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_nfl_playoff_picture(*, conference: str, auth_token: str) -> Dict[int, str]:
+    """
+    Fetch seed map from NFL football/v2 playoff picture.
+    Requires a user-provided JWT (Authorization: Bearer ...).
+    """
+    conf = conference.upper()
+    if conf not in CONFERENCES:
+        raise ValueError(f"conference must be one of {CONFERENCES}")
+
+    url = f"https://api.nfl.com/football/v2/standings/playoffpicture/{conf.lower()}"
+    headers = {"Authorization": auth_token.strip()}
+    r = requests.get(url, headers=headers, timeout=20)
+    if r.status_code == 401:
+        raise ValueError("NFL API returned 401 (unauthorized). Make sure your token is valid and includes the 'Bearer ' prefix.")
+    r.raise_for_status()
+    payload = r.json()
+    seed_map = _extract_seed_map(payload)
+    if sorted(seed_map.keys()) != list(range(1, 8)):
+        raise ValueError(
+            f"Could not extract a full 1..7 seed list from NFL response (found: {sorted(seed_map.keys())}). "
+            "NFL may have changed their payload format."
+        )
+    return seed_map
+
+
 def main() -> None:
     st.set_page_config(page_title="Super Bowl Winner Prediction Dashboard", layout="wide")
     st.title("Super Bowl Winner Prediction Dashboard")
@@ -196,11 +292,15 @@ def main() -> None:
         st.header("Data")
         source = st.radio(
             "Team ratings source",
-            ["Use sample playoff field", "Upload CSV", "Manual entry"],
+            ["Use sample playoff field", "Upload CSV", "Manual entry", "NFL playoff picture (API, requires token)"],
             index=0,
         )
 
         auto_seed = st.checkbox("Auto-seed 1..7 by rating within each conference", value=True)
+        if source == "NFL playoff picture (API, requires token)":
+            auto_seed = False
+            st.caption("Note: NFL's endpoint requires an authenticated JWT. Don’t share your token.")
+            nfl_token = st.text_input("Authorization header value", type="password", placeholder="Bearer <your_jwt_here>")
         if source == "Manual entry":
             cols = st.columns(2)
             with cols[0]:
@@ -229,6 +329,22 @@ def main() -> None:
             st.info("Upload a CSV to get started.")
             return
         raw = pd.read_csv(up)
+    elif source == "NFL playoff picture (API, requires token)":
+        if not nfl_token:
+            st.info("Paste your NFL Authorization token to fetch the current playoff picture.")
+            return
+        try:
+            afc = fetch_nfl_playoff_picture(conference="AFC", auth_token=nfl_token)
+            nfc = fetch_nfl_playoff_picture(conference="NFC", auth_token=nfl_token)
+        except Exception as e:
+            st.error(str(e))
+            return
+        rows: List[Dict[str, Any]] = []
+        for seed, team in sorted(afc.items()):
+            rows.append({"team": team, "conference": "AFC", "seed": int(seed), "rating": _default_rating_from_seed(int(seed))})
+        for seed, team in sorted(nfc.items()):
+            rows.append({"team": team, "conference": "NFC", "seed": int(seed), "rating": _default_rating_from_seed(int(seed))})
+        raw = pd.DataFrame(rows)
     else:
         st.caption(
             "Update teams/seeds week-to-week here. Add/remove rows as needed, then ensure you end up with 7 AFC + 7 NFC teams. "
