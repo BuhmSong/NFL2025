@@ -13,6 +13,8 @@ python3 -m pip install -r requirements.txt
 
 ## Data source
 
-This app mirrors the current playoff seeds shown on `https://www.nfl.com/standings/playoff-picture`.
+This app mirrors the current playoff seeds shown on `https://www.espn.com/nfl/standings/_/view/playoff`.
 
-Under the hood, the data is loaded from NFL’s authenticated endpoints, so you must paste your own **Authorization token** (`Bearer ...`) into the sidebar to fetch the latest playoff picture.
+Under the hood, it uses ESPN’s public standings endpoint:
+
+- `https://site.web.api.espn.com/apis/v2/sports/football/nfl/standings?view=playoff`
