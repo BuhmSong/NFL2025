@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import altair as alt
 import numpy as np
@@ -12,12 +13,53 @@ import streamlit as st
 
 REQUIRED_COLS = ["team", "conference", "seed", "rating"]
 CONFERENCES = ["AFC", "NFC"]
+PLAYOFF_PICTURE_URL = "https://www.nfl.com/standings/playoff-picture"
+NFL_API_BASE = "https://api.nfl.com/football/v2"
 
 
 @dataclass(frozen=True)
 class ModelParams:
     k: float = 400.0
     home_field_elo: float = 55.0
+
+
+@dataclass(frozen=True)
+class RatingParams:
+    """
+    Build an Elo-like rating *from NFL playoff-picture data*.
+
+    Notes:
+    - The NFL playoff-picture endpoints we use require authentication; the app can only be as "automatic"
+      as the available data allows.
+    - If some stats aren't present in the payload, we fall back to a seed-based baseline.
+    """
+
+    base_elo: float = 1500.0
+    elo_scale_from_win_pct: float = 400.0
+    point_diff_elo_per_point_per_game: float = 7.0
+    recent_form_elo_scale: float = 140.0
+    seed_baseline_step: float = 18.0
+
+
+@dataclass(frozen=True)
+class InjuryParams:
+    enabled: bool = True
+    qb_multiplier: float = 3.0
+    status_elo: Dict[str, float] = None  # filled in __post_init__ pattern below
+
+    def __post_init__(self) -> None:  # type: ignore[override]
+        if self.status_elo is None:
+            object.__setattr__(
+                self,
+                "status_elo",
+                {
+                    "out": -7.0,
+                    "doubtful": -4.0,
+                    "questionable": -2.0,
+                    "ir": -5.0,
+                    "inactive": -6.0,
+                },
+            )
 
 
 def elo_win_prob(rating_a: float, rating_b: float, *, params: ModelParams, home_advantage_a: float = 0.0) -> float:
@@ -185,13 +227,8 @@ def chart_probs(df_probs: pd.DataFrame, col: str, title: str) -> alt.Chart:
     )
 
 
-def _load_sample() -> pd.DataFrame:
-    return pd.read_csv("data_sample_playoffs.csv")
-
-
-def _default_rating_from_seed(seed: int) -> float:
-    # Simple starter rating curve; user can edit ratings later.
-    return 1560.0 + (8 - int(seed)) * 20.0
+def _default_rating_from_seed(seed: int, *, rp: RatingParams) -> float:
+    return rp.base_elo + (8 - int(seed)) * rp.seed_baseline_step
 
 
 def _team_name_from_obj(obj: Any) -> Optional[str]:
@@ -215,39 +252,125 @@ def _team_name_from_obj(obj: Any) -> Optional[str]:
     return None
 
 
-def _extract_seed_map(payload: Any) -> Dict[int, str]:
-    """
-    Heuristic extraction of seed -> team name from NFL playoff-picture payloads.
-    Keeps the *first* team encountered for each seed 1..7.
-    """
-    found: Dict[int, str] = {}
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_nfl_playoff_picture_payload(*, conference: str, auth_token: str) -> Any:
+    conf = conference.upper()
+    if conf not in CONFERENCES:
+        raise ValueError(f"conference must be one of {CONFERENCES}")
 
-    def walk(x: Any) -> None:
-        if len(found) == 7:
-            return
-        if isinstance(x, dict):
-            seed_val: Optional[int] = None
-            for sk in ["seed", "seedNumber", "seed_num", "seedRank", "seed_rank"]:
-                v = x.get(sk)
+    url = f"{NFL_API_BASE}/standings/playoffpicture/{conf.lower()}"
+    headers = {"Authorization": auth_token.strip()}
+    r = requests.get(url, headers=headers, timeout=20)
+    if r.status_code == 401:
+        raise ValueError(
+            "NFL playoff-picture endpoint returned 401 (unauthorized). "
+            "This data is not publicly accessible without an Authorization token."
+        )
+    r.raise_for_status()
+    return r.json()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_nfl_injuries_week(*, auth_token: str, season: int, season_type: str, week: int) -> Any:
+    """
+    Fetch weekly injury report.
+    Parameters are inferred from the playoff-picture payload where possible.
+    """
+    url = f"{NFL_API_BASE}/injuries/report/week"
+    headers = {"Authorization": auth_token.strip()}
+    params = {"season": int(season), "seasonType": str(season_type), "week": int(week)}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    if r.status_code == 401:
+        raise ValueError("NFL injuries endpoint returned 401 (unauthorized).")
+    r.raise_for_status()
+    return r.json()
+
+
+def _flatten_scalars(obj: Any) -> Iterable[Tuple[str, Any]]:
+    """Yield (lower_key, scalar_value) for nested dict/list structures."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            lk = str(k).strip().lower()
+            if isinstance(v, (dict, list)):
+                yield from _flatten_scalars(v)
+            else:
+                yield lk, v
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _flatten_scalars(v)
+
+
+def _pick_number(flat: Dict[str, List[Any]], *, keys_exact: List[str], keys_contains: List[str] | None = None) -> Optional[float]:
+    def as_num(x: Any) -> Optional[float]:
+        if isinstance(x, (int, float)):
+            return float(x)
+        try:
+            return float(str(x))
+        except Exception:
+            return None
+
+    for k in keys_exact:
+        lk = k.lower()
+        for v in flat.get(lk, []):
+            n = as_num(v)
+            if n is not None:
+                return n
+
+    if keys_contains:
+        for lk, values in flat.items():
+            if any(part.lower() in lk for part in keys_contains):
+                for v in values:
+                    n = as_num(v)
+                    if n is not None:
+                        return n
+    return None
+
+
+def _pick_str(flat: Dict[str, List[Any]], *, keys_exact: List[str], keys_contains: List[str] | None = None) -> Optional[str]:
+    for k in keys_exact:
+        lk = k.lower()
+        for v in flat.get(lk, []):
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    if keys_contains:
+        for lk, values in flat.items():
+            if any(part.lower() in lk for part in keys_contains):
+                for v in values:
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+    return None
+
+
+def _collect_seed_candidate_dicts(payload: Any) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+
+    def seed_from_dict(d: Dict[str, Any]) -> Optional[int]:
+        for sk in ["seed", "seednumber", "seed_num", "seedrank", "seed_rank"]:
+            if sk in {k.lower(): k for k in d.keys()}:
+                # fall through to generic scan below
+                break
+        for k, v in d.items():
+            lk = str(k).strip().lower()
+            if lk in {"seed", "seednumber", "seed_num", "seedrank", "seed_rank"}:
                 if isinstance(v, (int, float)) and int(v) == v:
                     iv = int(v)
                     if 1 <= iv <= 7:
-                        seed_val = iv
-                        break
+                        return iv
+                try:
+                    iv = int(str(v))
+                    if 1 <= iv <= 7:
+                        return iv
+                except Exception:
+                    pass
+        return None
 
-            if seed_val is not None and seed_val not in found:
-                # Try to find a name in this object or common nested keys.
-                name = None
-                for nk in ["team", "club", "franchise", "teamData", "teamInfo", "teamDetails"]:
-                    if nk in x:
-                        name = _team_name_from_obj(x.get(nk))
-                        if name:
-                            break
-                if not name:
-                    name = _team_name_from_obj(x)
+    def walk(x: Any) -> None:
+        if isinstance(x, dict):
+            seed = seed_from_dict(x)
+            if seed is not None:
+                name = _team_name_from_obj(x)
                 if name:
-                    found[seed_val] = name
-
+                    candidates.append(x)
             for v in x.values():
                 walk(v)
         elif isinstance(x, list):
@@ -255,64 +378,267 @@ def _extract_seed_map(payload: Any) -> Dict[int, str]:
                 walk(v)
 
     walk(payload)
-    return found
+    return candidates
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_nfl_playoff_picture(*, conference: str, auth_token: str) -> Dict[int, str]:
+def _best_seed_entries(payload: Any) -> Dict[int, Dict[str, Any]]:
+    """Pick the 'best' dict for each seed (prefer those with record-like fields)."""
+    cand = _collect_seed_candidate_dicts(payload)
+    by_seed: Dict[int, List[Dict[str, Any]]] = {}
+
+    def seed_from_dict(d: Dict[str, Any]) -> Optional[int]:
+        for k, v in d.items():
+            lk = str(k).strip().lower()
+            if lk in {"seed", "seednumber", "seed_num", "seedrank", "seed_rank"}:
+                try:
+                    iv = int(str(v))
+                except Exception:
+                    return None
+                return iv if 1 <= iv <= 7 else None
+        return None
+
+    def score(d: Dict[str, Any]) -> int:
+        flat: Dict[str, List[Any]] = {}
+        for k, v in _flatten_scalars(d):
+            flat.setdefault(k, []).append(v)
+        s = 0
+        # reward record-ish fields
+        for k in ["wins", "losses", "ties", "winpercentage", "percentage", "pointsfor", "pointsagainst", "pointdifferential"]:
+            if k in flat:
+                s += 2
+        # reward explicit team identifiers
+        for k in ["abbr", "abbreviation", "teamid", "gsisid", "id"]:
+            if k in flat:
+                s += 1
+        return s
+
+    for d in cand:
+        seed = seed_from_dict(d)
+        if seed is None:
+            continue
+        by_seed.setdefault(seed, []).append(d)
+
+    best: Dict[int, Dict[str, Any]] = {}
+    for seed, ds in by_seed.items():
+        best[seed] = sorted(ds, key=score, reverse=True)[0]
+    return best
+
+
+def _rating_from_seed_entry(seed: int, entry: Dict[str, Any], *, rp: RatingParams) -> Tuple[float, Dict[str, Any]]:
     """
-    Fetch seed map from NFL football/v2 playoff picture.
-    Requires a user-provided JWT (Authorization: Bearer ...).
+    Compute a team rating from whatever record-ish fields exist in the seed entry.
+    Returns (rating, debug_dict).
     """
-    conf = conference.upper()
-    if conf not in CONFERENCES:
-        raise ValueError(f"conference must be one of {CONFERENCES}")
+    flat: Dict[str, List[Any]] = {}
+    for k, v in _flatten_scalars(entry):
+        flat.setdefault(k, []).append(v)
 
-    url = f"https://api.nfl.com/football/v2/standings/playoffpicture/{conf.lower()}"
-    headers = {"Authorization": auth_token.strip()}
-    r = requests.get(url, headers=headers, timeout=20)
-    if r.status_code == 401:
-        raise ValueError("NFL API returned 401 (unauthorized). Make sure your token is valid and includes the 'Bearer ' prefix.")
-    r.raise_for_status()
-    payload = r.json()
-    seed_map = _extract_seed_map(payload)
-    if sorted(seed_map.keys()) != list(range(1, 8)):
-        raise ValueError(
-            f"Could not extract a full 1..7 seed list from NFL response (found: {sorted(seed_map.keys())}). "
-            "NFL may have changed their payload format."
-        )
-    return seed_map
+    wins = _pick_number(flat, keys_exact=["wins"], keys_contains=["wins"])
+    losses = _pick_number(flat, keys_exact=["losses"], keys_contains=["losses"])
+    ties = _pick_number(flat, keys_exact=["ties"], keys_contains=["ties"])
+    points_for = _pick_number(flat, keys_exact=["pointsfor"], keys_contains=["pointsfor", "pf"])
+    points_against = _pick_number(flat, keys_exact=["pointsagainst"], keys_contains=["pointsagainst", "pa"])
+    games = None
+
+    if wins is not None and losses is not None:
+        games = wins + losses + (ties or 0.0)
+
+    # Baseline: seed-based
+    rating = _default_rating_from_seed(seed, rp=rp)
+    debug: Dict[str, Any] = {
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "points_for": points_for,
+        "points_against": points_against,
+    }
+
+    # Win% to Elo-like rating (logit transform on win pct)
+    if wins is not None and losses is not None:
+        denom = wins + losses + (ties or 0.0)
+        if denom > 0:
+            wp = (wins + 0.5 * (ties or 0.0)) / denom
+            wp = float(np.clip(wp, 0.05, 0.95))
+            elo_from_wp = rp.base_elo + rp.elo_scale_from_win_pct * math.log10(wp / (1.0 - wp))
+            rating = elo_from_wp
+            debug["win_pct"] = wp
+            debug["elo_from_win_pct"] = elo_from_wp
+
+    # Point differential adjustment, if available
+    if points_for is not None and points_against is not None and games is not None and games > 0:
+        pd_per_game = (points_for - points_against) / games
+        pd_adj = pd_per_game * rp.point_diff_elo_per_point_per_game
+        rating = rating + pd_adj
+        debug["point_diff_per_game"] = pd_per_game
+        debug["elo_point_diff_adj"] = pd_adj
+
+    # Recent form: try to find last5 wins/losses if present
+    last5_w = _pick_number(flat, keys_exact=["last5wins"], keys_contains=["last5", "last_five", "lastfive"])
+    last5_l = _pick_number(flat, keys_exact=["last5losses"], keys_contains=["last5loss", "lastfive"])
+    if last5_w is not None and last5_l is not None:
+        last5_games = last5_w + last5_l
+        if last5_games > 0 and wins is not None and losses is not None:
+            last5_wp = last5_w / last5_games
+            overall_wp = (wins + 0.5 * (ties or 0.0)) / (wins + losses + (ties or 0.0))
+            form_adj = (last5_wp - overall_wp) * rp.recent_form_elo_scale
+            rating = rating + form_adj
+            debug["last5_win_pct"] = last5_wp
+            debug["elo_recent_form_adj"] = form_adj
+
+    return float(rating), debug
+
+
+def _compute_injury_adjustments(inj_payload: Any, *, ip: InjuryParams) -> Dict[str, float]:
+    """
+    Heuristic injury impact model from NFL injury payload.
+    Returns {team_name: elo_adjustment} (negative numbers mean worse).
+    """
+    if not ip.enabled:
+        return {}
+
+    adj: Dict[str, float] = {}
+
+    def norm_status(s: str) -> str:
+        s = s.strip().lower()
+        # common normalizations
+        if s in {"questionable", "ques"}:
+            return "questionable"
+        if s in {"doubtful", "doub"}:
+            return "doubtful"
+        if s in {"out"}:
+            return "out"
+        if s in {"inactive"}:
+            return "inactive"
+        if "injured reserve" in s or s == "ir":
+            return "ir"
+        return s
+
+    def walk(x: Any) -> None:
+        if isinstance(x, dict):
+            # Identify a likely player-injury record
+            flat: Dict[str, List[Any]] = {}
+            for k, v in _flatten_scalars(x):
+                flat.setdefault(k, []).append(v)
+
+            status = _pick_str(flat, keys_exact=["gameStatus", "gamestatus", "status"], keys_contains=["status"])
+            pos = _pick_str(flat, keys_exact=["position", "pos"], keys_contains=["position"])
+            if status:
+                st_norm = norm_status(status)
+                if st_norm in ip.status_elo:
+                    team = _team_name_from_obj(x.get("team")) or _team_name_from_obj(x.get("club")) or _team_name_from_obj(x)
+                    if team:
+                        delta = float(ip.status_elo[st_norm])
+                        if pos and pos.strip().upper() == "QB":
+                            delta *= float(ip.qb_multiplier)
+                        adj[team] = adj.get(team, 0.0) + delta
+
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(inj_payload)
+    return adj
+
+
+def _infer_season_week_from_payload(payload: Any) -> Tuple[Optional[int], Optional[str], Optional[int]]:
+    flat: Dict[str, List[Any]] = {}
+    for k, v in _flatten_scalars(payload):
+        flat.setdefault(k, []).append(v)
+    season = _pick_number(flat, keys_exact=["season"], keys_contains=["season"])
+    week = _pick_number(flat, keys_exact=["week"], keys_contains=["week"])
+    season_type = _pick_str(flat, keys_exact=["seasonType", "seasontype"], keys_contains=["seasontype"])
+    # Normalize seasonType into common NFL strings
+    if season_type:
+        st = season_type.strip().upper()
+        if st in {"REG", "POST", "PRE"}:
+            season_type = st
+    return (int(season) if season is not None else None), season_type, (int(week) if week is not None else None)
+
+
+def build_playoff_field_from_nfl(
+    *,
+    auth_token: str,
+    rp: RatingParams,
+    ip: InjuryParams,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    payloads = {
+        "AFC": fetch_nfl_playoff_picture_payload(conference="AFC", auth_token=auth_token),
+        "NFC": fetch_nfl_playoff_picture_payload(conference="NFC", auth_token=auth_token),
+    }
+
+    rows: List[Dict[str, Any]] = []
+    debug_by_team: Dict[str, Any] = {}
+
+    # Try to infer season/week from the payload and apply injury adjustments.
+    season, season_type, week = _infer_season_week_from_payload(payloads["AFC"])
+    injury_adj_by_team: Dict[str, float] = {}
+    injury_meta: Dict[str, Any] = {"season": season, "seasonType": season_type, "week": week}
+    if ip.enabled and season is not None and season_type is not None and week is not None:
+        try:
+            inj_payload = fetch_nfl_injuries_week(auth_token=auth_token, season=season, season_type=season_type, week=week)
+            injury_adj_by_team = _compute_injury_adjustments(inj_payload, ip=ip)
+            injury_meta["injuries_loaded"] = True
+        except Exception:
+            injury_meta["injuries_loaded"] = False
+    else:
+        injury_meta["injuries_loaded"] = False
+
+    for conf, payload in payloads.items():
+        best = _best_seed_entries(payload)
+        if sorted(best.keys()) != list(range(1, 8)):
+            raise ValueError(
+                f"Could not extract a full 1..7 seed list for {conf} (found: {sorted(best.keys())}). "
+                "NFL may have changed their payload format."
+            )
+        for seed in range(1, 8):
+            entry = best[seed]
+            team = _team_name_from_obj(entry)
+            if not team:
+                raise ValueError(f"Could not extract team name for {conf} seed {seed}.")
+            rating, dbg = _rating_from_seed_entry(seed, entry, rp=rp)
+            inj_adj = float(injury_adj_by_team.get(team, 0.0))
+            rating = float(rating + inj_adj)
+            rows.append({"team": team, "conference": conf, "seed": seed, "rating": rating})
+            debug_by_team[team] = {"conference": conf, "seed": seed, "injury_elo_adj": inj_adj, **dbg, **injury_meta}
+
+    df = normalize_input_df(pd.DataFrame(rows))
+    validate_playoff_field(df)
+    return df.sort_values(["conference", "seed"]).reset_index(drop=True), debug_by_team
 
 
 def main() -> None:
     st.set_page_config(page_title="Super Bowl Winner Prediction Dashboard", layout="wide")
     st.title("Super Bowl Winner Prediction Dashboard")
+    st.caption(f"Playoff picture source: `{PLAYOFF_PICTURE_URL}`")
 
     with st.sidebar:
         st.header("Data")
-        source = st.radio(
-            "Team ratings source",
-            ["Use sample playoff field", "Upload CSV", "Manual entry", "NFL playoff picture (API, requires token)"],
-            index=0,
-        )
-
-        auto_seed = st.checkbox("Auto-seed 1..7 by rating within each conference", value=True)
-        if source == "NFL playoff picture (API, requires token)":
-            auto_seed = False
-            st.caption("Note: NFL's endpoint requires an authenticated JWT. Don’t share your token.")
-            nfl_token = st.text_input("Authorization header value", type="password", placeholder="Bearer <your_jwt_here>")
-        if source == "Manual entry":
-            cols = st.columns(2)
-            with cols[0]:
-                if st.button("Reset editor to sample"):
-                    st.session_state["manual_field_df"] = _load_sample()
-            with cols[1]:
-                st.caption("Edits re-run the simulation automatically.")
+        st.caption("This app mirrors the current playoff seeds from NFL and re-runs the simulation automatically.")
+        st.caption("Because NFL’s underlying data endpoints require auth, you must provide your own token.")
+        nfl_token = st.text_input("NFL Authorization token", type="password", placeholder="Bearer <your_jwt_here>")
+        refresh = st.button("Refresh from NFL now", use_container_width=True)
+        if refresh:
+            fetch_nfl_playoff_picture_payload.clear()
+            fetch_nfl_injuries_week.clear()
+            st.cache_data.clear()
         st.divider()
 
         st.header("Model")
         home_field_elo = st.slider("Home-field advantage (Elo points)", 0, 120, 55, 5)
         k = st.slider("Elo scale (higher = less sensitive)", 200, 600, 400, 25)
+
+        st.subheader("Rating inputs (from NFL data)")
+        base_elo = st.slider("Base Elo", 1300, 1700, 1500, 10)
+        elo_scale_from_wp = st.slider("Win% → Elo scale", 200, 700, 400, 25)
+        pd_weight = st.slider("Point diff weight (Elo per point/game)", 0.0, 15.0, 7.0, 0.5)
+        form_weight = st.slider("Recent form weight", 0.0, 250.0, 140.0, 10.0)
+        seed_step = st.slider("Seed baseline step (fallback)", 0.0, 40.0, 18.0, 1.0)
+
+        st.subheader("Injuries (from NFL)")
+        injuries_on = st.toggle("Apply injury adjustments", value=True)
+        qb_mult = st.slider("QB injury multiplier", 1.0, 5.0, 3.0, 0.5)
 
         st.divider()
         st.header("Simulation")
@@ -320,70 +646,77 @@ def main() -> None:
         rng_seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=2025, step=1)
 
     params = ModelParams(k=float(k), home_field_elo=float(home_field_elo))
+    rp = RatingParams(
+        base_elo=float(base_elo),
+        elo_scale_from_win_pct=float(elo_scale_from_wp),
+        point_diff_elo_per_point_per_game=float(pd_weight),
+        recent_form_elo_scale=float(form_weight),
+        seed_baseline_step=float(seed_step),
+    )
+    ip = InjuryParams(enabled=bool(injuries_on), qb_multiplier=float(qb_mult))
 
-    if source == "Use sample playoff field":
-        raw = _load_sample()
-    elif source == "Upload CSV":
-        up = st.file_uploader("Upload a CSV with columns: team, conference, seed, rating", type=["csv"])
-        if up is None:
-            st.info("Upload a CSV to get started.")
-            return
-        raw = pd.read_csv(up)
-    elif source == "NFL playoff picture (API, requires token)":
-        if not nfl_token:
-            st.info("Paste your NFL Authorization token to fetch the current playoff picture.")
-            return
-        try:
-            afc = fetch_nfl_playoff_picture(conference="AFC", auth_token=nfl_token)
-            nfc = fetch_nfl_playoff_picture(conference="NFC", auth_token=nfl_token)
-        except Exception as e:
-            st.error(str(e))
-            return
-        rows: List[Dict[str, Any]] = []
-        for seed, team in sorted(afc.items()):
-            rows.append({"team": team, "conference": "AFC", "seed": int(seed), "rating": _default_rating_from_seed(int(seed))})
-        for seed, team in sorted(nfc.items()):
-            rows.append({"team": team, "conference": "NFC", "seed": int(seed), "rating": _default_rating_from_seed(int(seed))})
-        raw = pd.DataFrame(rows)
-    else:
-        st.caption(
-            "Update teams/seeds week-to-week here. Add/remove rows as needed, then ensure you end up with 7 AFC + 7 NFC teams. "
-            "Ratings are Elo-like (1500 ~ average)."
-        )
-        if "manual_field_df" not in st.session_state:
-            st.session_state["manual_field_df"] = _load_sample()
-        raw = st.data_editor(
-            st.session_state["manual_field_df"],
-            num_rows="dynamic",
-            use_container_width=True,
-            key="manual_field_editor",
-        )
-        # Persist edits across reruns within the session.
-        st.session_state["manual_field_df"] = pd.DataFrame(raw)
+    if not nfl_token:
+        st.info("Enter your NFL `Authorization: Bearer ...` token in the sidebar to load the current playoff picture.")
+        st.stop()
 
     try:
-        df = normalize_input_df(pd.DataFrame(raw))
-        if auto_seed:
-            df = auto_seed_by_rating(df)
-        validate_playoff_field(df)
+        df, rating_debug = build_playoff_field_from_nfl(auth_token=nfl_token, rp=rp, ip=ip)
     except Exception as e:
         st.error(str(e))
-        return
+        st.stop()
 
-    left, right = st.columns([1.05, 0.95], gap="large")
+    # Streamlined UI
+    top = st.container()
+    tabs = st.tabs(["Overview", "Playoff picture", "Matchups", "Debug"])
 
-    with left:
-        st.subheader("Playoff field")
-        st.dataframe(df.sort_values(["conference", "seed"]), use_container_width=True, hide_index=True)
+    with top:
+        probs = simulate_playoffs(df, params=params, n_sims=int(n_sims), rng_seed=int(rng_seed))
+        winner = probs.iloc[0]
+        c1, c2, c3 = st.columns([1.2, 0.9, 0.9])
+        with c1:
+            st.metric("Predicted Super Bowl winner", str(winner["team"]), f"{winner['p_super_bowl']*100:.1f}%")
+        with c2:
+            st.metric("Simulations", f"{int(n_sims):,}")
+        with c3:
+            st.metric("Home-field Elo", f"{params.home_field_elo:.0f}")
+
+    with tabs[0]:
+        left, right = st.columns([1, 1], gap="large")
+        with left:
+            st.subheader("Super Bowl win probabilities")
+            st.altair_chart(chart_probs(probs, "p_super_bowl", "Chance to win the Super Bowl"), use_container_width=True)
+        with right:
+            st.subheader("Conference win probabilities")
+            st.altair_chart(chart_probs(probs, "p_conf", "Chance to win conference"), use_container_width=True)
+
+        st.subheader("Full probabilities table")
+        show = probs.copy()
+        show["p_conf"] = (show["p_conf"] * 100.0).round(2)
+        show["p_super_bowl"] = (show["p_super_bowl"] * 100.0).round(2)
+        show = show.rename(columns={"p_conf": "p_conf_%", "p_super_bowl": "p_super_bowl_%"})
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        st.subheader("Current playoff seeds (from NFL)")
+        afc = df.loc[df["conference"] == "AFC"].sort_values("seed")
+        nfc = df.loc[df["conference"] == "NFC"].sort_values("seed")
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            st.markdown("**AFC**")
+            st.dataframe(afc[["seed", "team", "rating"]], use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("**NFC**")
+            st.dataframe(nfc[["seed", "team", "rating"]], use_container_width=True, hide_index=True)
 
         st.download_button(
-            "Download this field as CSV",
+            "Download current field as CSV",
             data=df[REQUIRED_COLS].to_csv(index=False).encode("utf-8"),
-            file_name="playoff_field.csv",
+            file_name="playoff_field_from_nfl.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
+    with tabs[2]:
         st.subheader("Matchup win probability")
         teams = df["team"].tolist()
         a, b, loc = st.columns([1, 1, 1])
@@ -400,22 +733,18 @@ def main() -> None:
         hfa_a = -params.home_field_elo if venue == "Team B home" else hfa_a
         p_a = elo_win_prob(ra, rb, params=params, home_advantage_a=hfa_a)
         st.metric("P(Team A wins)", f"{p_a*100:.1f}%")
+        st.caption("Home/away is modeled via the Home-field Elo slider. (Injury + point-spread integrations require additional data sources.)")
 
-    with right:
-        st.subheader("Super Bowl win probabilities")
-        probs = simulate_playoffs(df, params=params, n_sims=int(n_sims), rng_seed=int(rng_seed))
-        winner = probs.iloc[0]
-        st.success(f"Prediction (by simulation): **{winner['team']}** ({winner['p_super_bowl']*100:.1f}% to win Super Bowl)")
-
-        st.altair_chart(chart_probs(probs, "p_super_bowl", "Chance to win the Super Bowl"), use_container_width=True)
-        st.altair_chart(chart_probs(probs, "p_conf", "Chance to win conference"), use_container_width=True)
-
-        st.subheader("Full table")
-        show = probs.copy()
-        show["p_conf"] = (show["p_conf"] * 100.0).round(2)
-        show["p_super_bowl"] = (show["p_super_bowl"] * 100.0).round(2)
-        show = show.rename(columns={"p_conf": "p_conf_%", "p_super_bowl": "p_super_bowl_%"})
-        st.dataframe(show, use_container_width=True, hide_index=True)
+    with tabs[3]:
+        st.subheader("Rating debug (what we extracted from NFL)")
+        dbg_df = (
+            pd.DataFrame.from_dict(rating_debug, orient="index")
+            .reset_index()
+            .rename(columns={"index": "team"})
+            .sort_values(["conference", "seed"])
+        )
+        st.dataframe(dbg_df, use_container_width=True, hide_index=True)
+        st.caption("If wins/points fields are missing here, NFL likely changed the payload or restricted fields.")
 
 
 if __name__ == "__main__":

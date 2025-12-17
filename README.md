@@ -5,19 +5,14 @@ Interactive dashboard to estimate who is most likely to win the Super Bowl, usin
 ## Run locally
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
+python3 -m pip install -r requirements.txt
+~/.local/bin/streamlit run app.py
 ```
 
-## Input data format
+## Data source
 
-The app expects **14 rows** (7 AFC + 7 NFC playoff teams) with these columns:
+This app mirrors the current playoff seeds shown on `https://www.nfl.com/standings/playoff-picture`.
 
-- `team`: team name (unique)
-- `conference`: `AFC` or `NFC`
-- `seed`: 1..7 within each conference (if you enable auto-seeding, this can be any number)
-- `rating`: Elo-like rating (higher = better; 1500 ~ average)
-
-Use `data_sample_playoffs.csv` as a template.
+Under the hood, the data is loaded from NFL’s authenticated endpoints, so you must paste your own **Authorization token** (`Bearer ...`) into the sidebar to fetch the latest playoff picture.
